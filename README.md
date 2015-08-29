@@ -15,7 +15,8 @@ This idea is to accelerate the acd_cli fuse mount using some c.
 ##Benchmark
 
 ### acdfuse_c
-```./acdfuse acd/
+```
+./acdfuse acd/
 time find acd/ > /dev/null
 
 real	0m10.172s
@@ -24,7 +25,8 @@ sys	0m0.193s
 ```
 
 ###acd_cli
-```acd_cli mount acd/
+```
+acd_cli mount acd/
 time find acd/ > /dev/null
 
 real	4m25.864s
