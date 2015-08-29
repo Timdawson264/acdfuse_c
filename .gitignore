@@ -1,3 +1,7 @@
+#project
+acdfuse
+acd/
+
 # Object files
 *.o
 *.ko
