@@ -31,10 +31,20 @@
 
 static sqlite3 *db;
 
+//SQL - Get the root node id
 static const char * rootSQL = "select ID from nodes where name is NULL";
+
+//SQL - gets the id of a subdir or file in a perent folder given by id - for path -> ID
+//sprintf params - subdir/file Name, Parents ID 
 static const char * NextFolderSQL = "select id from nodes where name=\"%s\" and id in  (select child from  parentage where parent is \"%s\")";
+
+//SQL - gets the name and type of all sub files/folders of given parent ID - for readdir
+//sprintf params - Parents ID 
 static const char * ListFolderSQL = "select name,type from nodes where status='AVAILABLE' and id in (select child from  parentage where parent is \"%s\")";
-static const char * FileInfoSQL = "SELECT nodes.name, nodes.type, nodes.created, nodes.modified, files.size, files.md5 FROM nodes LEFT JOIN files ON nodes.id=files.id where nodes.id=\"%s\"";
+
+//SQL returns file info given by ID - for getattr
+//sprintf params - Node ID
+static const char * FileInfoSQL = "SELECT nodes.type, strftime(\"%%s\",nodes.created), strftime(\"%%s\",nodes.modified), strftime(\"%%s\",nodes.updated), files.size, files.md5 FROM nodes LEFT JOIN files ON nodes.id=files.id where nodes.id=\"%s\"";
 
 
 static int SQLcallback_readdir_id(void *ctx, int argc, char **argv, char **colnamev){
@@ -47,20 +57,36 @@ static int SQLcallback_readdir_id(void *ctx, int argc, char **argv, char **colna
 
 static int SQLcallback_getattr(void *ctx, int argc, char **argv, char **colnamev){
         struct stat *stbuf = ctx;
+        long long unsigned int tmp;
         
         fprintf(stderr,"%s,%s\n", argv[0], argv[1]);
-        if(strcmp(argv[1], "folder")==0){
+        if(strcmp(argv[0], "folder")==0){
                 stbuf->st_mode = S_IFDIR | 0777;
-                stbuf->st_nlink = 2;
+                stbuf->st_nlink = 1;
         }
-        if(strcmp(argv[1], "file")==0){
+        if(strcmp(argv[0], "file")==0){
                 stbuf->st_mode = S_IFREG | 0444;
 		stbuf->st_nlink = 1;
-                long long unsigned int size;
-                sscanf(argv[4], "%llu",&size);
-		stbuf->st_size = size;
 
+                //off_t st_size - For regular files, the file size in bytes
+                sscanf(argv[4], "%llu",&tmp);
+		stbuf->st_size = tmp;
+
+                //argv[5] is md5 - for xattr
         }
+
+        //time_t st_ctime - Time of last status change
+        sscanf(argv[1], "%llu",&tmp);
+        stbuf->st_ctime = tmp;
+
+        //time_t st_mtime - Time of last data modification
+        sscanf(argv[2], "%llu",&tmp);
+        stbuf->st_mtime = tmp;
+        
+        //time_t st_atime - Time of last access
+        sscanf(argv[3], "%llu",&tmp);
+        stbuf->st_atime = tmp;
+                
         return 0;
 }
 

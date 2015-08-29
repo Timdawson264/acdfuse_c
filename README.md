@@ -3,7 +3,8 @@ This project uses sqlite3 libcurl and uses the [acd_cli](https://github.com/yada
 This idea is to accelerate the acd_cli fuse mount using some c.
 
 ##TODO
-- set st_ctime and st_mtime in SQLcallback_getattr
+- ~~set st_ctime and st_mtime in SQLcallback_getattr~~ 
+- handle database locked
 - seems to have issues on armhf.
 - also has issues with relative paths (might be libfuse)
 
