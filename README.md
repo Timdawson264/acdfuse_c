@@ -1,8 +1,9 @@
 ##About
-This project uses sqlite3 libcurl and uses the acd_cli sqlite db.
+This project uses sqlite3 libcurl and uses the [acd_cli](https://github.com/yadayada/acd_cli/) sqlite db.
 This idea is to accelerate the acd_cli fuse mount using some c.
 
 ##TODO
+- set st_ctime and st_mtime in SQLcallback_getattr
 - seems to have issues on armhf.
 - also has issues with relative paths (might be libfuse)
 
