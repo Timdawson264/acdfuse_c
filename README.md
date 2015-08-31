@@ -9,7 +9,7 @@ This idea is to accelerate the acd_cli fuse mount using some c.
 - also has issues with relative paths (might be libfuse)
 
 ##build
-``` gcc acdfuse.c `pkg-config fuse --cflags --libs` `pkg-config sqlite3--cflags --libs` `pkg-config libcurl --cflags --libs` -ggdb -o acdfuse; ```
+``` gcc acdfuse.c `pkg-config fuse sqlite3 libcurl --cflags --libs` -ggdb -o acdfuse; ```
 
 ##mount
 ./acdfuse [-d]  mountpoint [-o options]
