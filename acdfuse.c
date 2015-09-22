@@ -24,9 +24,12 @@
 #include <stdlib.h>
 #include <string.h>
 #include <tgmath.h>
-#include <sys/stat.h>
 #include <pthread.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
+#include "ringbuf.h"
 #include <curl/curl.h>
 
 static sqlite3 *db;
@@ -59,7 +62,7 @@ static int SQLcallback_getattr(void *ctx, int argc, char **argv, char **colnamev
         struct stat *stbuf = ctx;
         long long unsigned int tmp;
         
-        fprintf(stderr,"%s,%s\n", argv[0], argv[1]);
+        fprintf(stderr,"GETATTR: %s,%s\n", argv[0], argv[4]);
         if(strcmp(argv[0], "folder")==0){
                 stbuf->st_mode = S_IFDIR | 0777;
                 stbuf->st_nlink = 1;
@@ -107,7 +110,7 @@ int acd_path_to_id(const char *path, char * ID){
         /* Get Next folder ids */
         char * tok;
         char * tok_ctx;
-        tok = strtok_r(path,"/", &tok_ctx);
+        tok = strtok_r((char*)path,"/", &tok_ctx);
         while (tok != NULL){
                 //Tok the name of next folder
                 TmpID[0]=0;
@@ -162,7 +165,7 @@ static int SQLcallback_readdir_fill(void *ctx, int argc, char **argv, char **col
         if(strcmp(argv[1],"folder")==0){        
                 st.st_mode=S_IFDIR|0755;
                 st.st_nlink = 2;
-        }
+        }  
         if(strcmp(argv[1],"file")==0){
                 st.st_mode=S_IFREG|0444;
                 st.st_nlink = 1;
@@ -212,18 +215,114 @@ static int acd_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
 }
 
 typedef struct{
-        size_t size;//downloaded amount
-        size_t total;//total to be downloaded
-        void * buf;
-        uint8_t first;
-        pthread_mutex_t mutex;
         CURL *curl;
         char * url;
+        int abort_curl;
+        size_t filesize;
+        pthread_t curlthread; //thread that runs http client
+        int thread_done;
+        
+        ringbuf_t rb; //large circ buffer
+        pthread_mutex_t writemutex; //single access to read buffer
+        size_t offset; //ammount of file read by curl so fa
+        pthread_mutex_t readmutex; //single access to read buffer
+        
 }file_ctx;
+
+size_t curl_callback(char *ptr, size_t size, size_t nmemb, void *userdata){
+        file_ctx * ctx = (file_ctx*)userdata;
+        size_t amount = (size*nmemb);
+        fprintf(stderr,"CURL: %u\n", amount);
+
+        if(ctx->abort_curl==1){
+                fprintf(stderr, "CURL ABORT\n");
+                return 0;
+        }
+
+        while(ringbuf_bytes_free(ctx->rb) < amount){
+                sleep(1); //block till we have space
+        }
+
+        ringbuf_memcpy_into(ctx->rb, ptr, amount);
+        ctx->offset+=amount;
+        return amount;
+}
+
+//Curl pthread
+void * curl_thread(void * ptr){
+        file_ctx * ctx = (file_ctx*) ptr;
+        char range[512];
+        size_t free = 0;
+        
+        while(1){
+                pthread_mutex_lock(&ctx->writemutex);
+                if(ctx->abort_curl || ctx->thread_done){
+                        pthread_mutex_unlock(&ctx->writemutex);
+                        if(ctx->thread_done) return 0;//shutting down thread
+                        usleep(100);
+                        continue;//let read reset offset
+                }
+                
+                //find out how much data we want to fill buffers
+                free = ringbuf_bytes_free(ctx->rb);
+                if( free == 0 ) continue; //buffer full
+                
+
+                //limit range to filesize
+                sprintf(range,"%u-%u", ctx->offset , ctx->offset+MIN(free,ctx->filesize-ctx->offset) -1); 
+                fprintf(stderr, "CURL START - range: %s, remaining:%u\n", range, ctx->filesize-ctx->offset);    
+                if(ctx->curl){
+                        curl_easy_setopt(ctx->curl, CURLOPT_RANGE, range);
+                        curl_easy_perform(ctx->curl);
+                }
+                pthread_mutex_unlock(&ctx->writemutex);
+        }
+}
+
+static int acd_read(const char *path, char *buf, size_t size, off_t offset,
+		      struct fuse_file_info *fi)
+{
+	size_t len;
+        file_ctx * ctx = (file_ctx *) fi->fh;
+        pthread_mutex_lock(&ctx->readmutex);
+
+        //check if read is backwards.
+        
+        size_t bufoffset = (ctx->offset-ringbuf_bytes_used(ctx->rb)); //file offset of buffer
+        //if buffer is ahead of read || read is ahead of buffer
+        if( offset != bufoffset){ //non continuouse read               
+                ctx->abort_curl=1;//stop curl callbacks
+                ringbuf_reset(ctx->rb); //empty current buffer
+                
+                pthread_mutex_lock(&ctx->writemutex); //lock the write thread
+                fprintf(stderr,"READ Reset: http offset: %u, buffered: %u, read offset: %u\n", ctx->offset, ringbuf_bytes_used(ctx->rb), offset);
+                ctx->offset=offset; //set new offset for http reads
+                ringbuf_reset(ctx->rb); //empty current buffer
+                ctx->abort_curl=0; //allow callbacks
+                pthread_mutex_unlock(&ctx->writemutex);
+        }
+                 
+        fprintf(stderr, "READ: %s, size:%u, off:%u\n", path, size, offset);
+        size = MIN(size,ctx->filesize-offset); //dont underflow buffer
+        
+        while( ringbuf_bytes_used(ctx->rb) <  size){
+                //fprintf(stderr, ".");//block till we have enough data
+                usleep(100);
+        }
+        
+        ringbuf_memcpy_from(buf, ctx->rb, size);
+        
+        pthread_mutex_unlock(&ctx->readmutex);
+	return size;
+}
 
 static int acd_open(const char *path, struct fuse_file_info *fi)
 {
         char ID[50];
+        char *zErrMsg = 0;
+        int rc;
+        char SQLstr[1024];
+        
         if(acd_path_to_id(path, ID)){
                 fprintf(stderr,"No Such Path: %s",path);
                 return -ENOENT;
@@ -233,14 +332,20 @@ static int acd_open(const char *path, struct fuse_file_info *fi)
         FILE *fp;
         char cmd[1024];
         sprintf(cmd, "acd_cli m %s", ID);
+        fprintf(stderr,"POPEN: %s\n", cmd);
         fp = popen(cmd, "r");
         if (fp == NULL) {
                 fprintf(stderr,"Failed to run command\n" );
         }
 
         while (fgets(cmd, sizeof(cmd)-1, fp) != NULL) {
+                //fprintf(stderr,"%s\n", cmd);
+                
+                if(strstr(cmd,"RequestError")){
+                        return -EHOSTDOWN; 
+                }
+                
                 if(strstr(cmd,"tempLink")){
-                        fprintf(stderr,"%s\n", cmd);
                         break;
                 }
                 
@@ -257,73 +362,71 @@ static int acd_open(const char *path, struct fuse_file_info *fi)
         
         fprintf(stderr,"URL: %s\n", url);
 
-        file_ctx * ctx = malloc(sizeof(file_ctx));
-        ctx->url = malloc(strlen(url)+1);
-        strcpy(ctx->url, url);
+        file_ctx * ctx = calloc(1, sizeof(file_ctx));
+        fi->fh = (void*) ctx;
+        
+        ctx->url = strdup(url);
+        //TODO: Adaptive buffer sizing
+        ctx->rb = ringbuf_new(1024*1024*10); //10MB read buffer
+        //Get Size
+        struct stat st;
+        st.st_size=0;
 
-        pthread_mutex_init(&ctx->mutex, NULL);
-        ctx->first=1;
-        fi->fh = (void*)ctx;
+        sprintf(SQLstr, FileInfoSQL, ID);
+        rc = sqlite3_exec(db, SQLstr, SQLcallback_getattr, (void*)&st, &zErrMsg);
+        if( rc!=SQLITE_OK ){
+                fprintf(stderr, "SQL error: %s\n", zErrMsg);
+                sqlite3_free(zErrMsg);
+        }
+        
+        ctx->filesize = st.st_size;
+        ctx->offset = 0;
+        fprintf(stderr,"OPEN: FileSize: %u" , ctx->filesize);
+        pthread_mutex_init(&ctx->readmutex, NULL);
+        pthread_mutex_init(&ctx->writemutex, NULL);
+        
+        ctx->curl = curl_easy_init();   
+        if(!ctx->curl){
+                fprintf(stderr,"Curl init failed",path);
+                return -ENOENT;
+        }
+        //curl_easy_setopt(ctx->curl, CURLOPT_VERBOSE, 1L);
+        curl_easy_setopt(ctx->curl, CURLOPT_URL, ctx->url);
+        curl_easy_setopt(ctx->curl, CURLOPT_WRITEFUNCTION, curl_callback);
+        curl_easy_setopt(ctx->curl, CURLOPT_WRITEDATA, ctx);
+
+        pthread_create( &ctx->curlthread, NULL, curl_thread, (void*)ctx);
+        
         return 0;
 }
 
-
-size_t curl_callback(char *ptr, size_t size, size_t nmemb, void *userdata){
-        file_ctx * ctx = (file_ctx*)userdata;
-
-        fprintf(stderr,"CURL: %u, %u of %u \n", size*nmemb, ctx->size, ctx->total );
-        memcpy(ctx->buf+ctx->size, ptr, (size*nmemb));
-        ctx->size+=(size*nmemb);
-
-        return (size*nmemb);
+static int acd_release(const char *path, struct fuse_file_info *fi){
+        file_ctx * ctx = (file_ctx *) fi->fh;
+        fprintf(stderr, "RELEASE start: %s\n", path);
+        
+        //Stop htto thread
+        ctx->abort_curl=1;//stop curl callbacks
+        ctx->thread_done=1;//kill the thread
+        ringbuf_reset(ctx->rb); //empty current buffer to force a callback loop
+        fprintf(stderr, "RELEASE writemutex: %s\n", path);
+        pthread_join(ctx->curlthread, NULL); // wait for thread to end
+        
+        //Free the memory
+        pthread_mutex_destroy(&ctx->writemutex);
+        pthread_mutex_destroy(&ctx->readmutex);
+        curl_easy_cleanup(ctx->curl); 
+        free(ctx->url); //string
+        ringbuf_free(&ctx->rb);//ringbuffer
+        free(ctx);
+        fprintf(stderr, "RELEASE done: %s\n", path);
 }
 
-static int acd_read(const char *path, char *buf, size_t size, off_t offset,
-		      struct fuse_file_info *fi)
-{
-	size_t len;
-	(void) fi;
-        char range[512];
-
-        sprintf(range,"%u-%u", offset, offset+size-1); 
-        fprintf(stderr, "READ: %s, size:%u, off:%u, range:%s\n", path,size,offset, range);
-
-        file_ctx * ctx = fi->fh;
-        pthread_mutex_lock(&ctx->mutex);
-        
-        ctx->size=0;
-        ctx->buf = buf;
-        ctx->total=size;
-        memset(buf, 0, size);
-        
-        if(ctx->first){
-                ctx->curl = curl_easy_init();   
-                if(!ctx->curl){
-                        fprintf(stderr,"Curl init failed",path);
-                        return -ENOENT;
-                }
-                //curl_easy_setopt(ctx->curl, CURLOPT_VERBOSE, 1L);
-                curl_easy_setopt(ctx->curl, CURLOPT_URL, ctx->url);
-                curl_easy_setopt(ctx->curl, CURLOPT_WRITEFUNCTION, curl_callback);
-                curl_easy_setopt(ctx->curl, CURLOPT_WRITEDATA, ctx);
-                ctx->first=0;
-        }
-
-        if(ctx->curl){
-                curl_easy_setopt(ctx->curl, CURLOPT_RANGE, range);
-                curl_easy_perform(ctx->curl);
-        }
-        
-        
-        size=ctx->size;
-        pthread_mutex_unlock(&ctx->mutex);        
-	return size;
-}
 
 static struct fuse_operations acd_oper = {
 	.getattr	= acd_getattr,
 	.readdir	= acd_readdir,
 	.open		= acd_open,
+        .release        = acd_release,
 	.read		= acd_read,
 };
 
