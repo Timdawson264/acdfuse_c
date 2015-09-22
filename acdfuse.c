@@ -240,7 +240,7 @@ size_t curl_callback(char *ptr, size_t size, size_t nmemb, void *userdata){
         }
 
         while(ringbuf_bytes_free(ctx->rb) < amount){
-                sleep(1); //block till we have space
+                usleep(100); //block till we have space
         }
 
         ringbuf_memcpy_into(ctx->rb, ptr, amount);
@@ -269,7 +269,10 @@ void * curl_thread(void * ptr){
                 
 
                 //limit range to filesize
-                sprintf(range,"%u-%u", ctx->offset , ctx->offset+MIN(free,ctx->filesize-ctx->offset) -1); 
+                //sprintf(range,"%u-%u", ctx->offset , ctx->offset+MIN(free,ctx->filesize-ctx->offset) -1);
+
+                /* just request offset to end of file - can waste network bandwidth if a non seqential read happenss  */
+                sprintf(range,"%u-%u", ctx->offset , ctx->filesize -1); 
                 fprintf(stderr, "CURL START - range: %s, remaining:%u\n", range, ctx->filesize-ctx->offset);    
                 if(ctx->curl){
                         curl_easy_setopt(ctx->curl, CURLOPT_RANGE, range);
@@ -284,7 +287,7 @@ static int acd_read(const char *path, char *buf, size_t size, off_t offset,
 {
 	size_t len;
         file_ctx * ctx = (file_ctx *) fi->fh;
-        pthread_mutex_lock(&ctx->readmutex);
+        pthread_mutex_lock(&ctx->readmutex); //used for async reads - prevents two reads at same time 
 
         //check if read is backwards.
         
@@ -309,7 +312,8 @@ static int acd_read(const char *path, char *buf, size_t size, off_t offset,
                 //fprintf(stderr, ".");//block till we have enough data
                 usleep(100);
         }
-        
+
+        //copy accross data
         ringbuf_memcpy_from(buf, ctx->rb, size);
         
         pthread_mutex_unlock(&ctx->readmutex);
